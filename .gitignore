@@ -173,3 +173,6 @@ utils/config.py
 #Ignore big processed files
 data/processed/processed_podcast_data.csv
 data/processed/toy_processed_podcast_data.csv
+
+#Ignore DS_Store
+.DS_Store
