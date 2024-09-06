@@ -168,7 +168,7 @@ data/raw/
 data/embeddings
 
 # Ignore config file
-utils/config.py
+src/utils/config.py
 
 #Ignore big processed files
 data/processed/processed_podcast_data.csv
