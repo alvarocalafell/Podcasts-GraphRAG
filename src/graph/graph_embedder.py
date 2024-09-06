@@ -16,21 +16,15 @@ class GraphEmbedder:
     def __init__(self):
         self.driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
         self.graph: Optional[nx.DiGraph] = None
-        self.embeddings: Optional[Dict[int, np.ndarray]] = None
-        self.node_id_map: Dict[int, int] = {}  # Map Neo4j node IDs to consecutive integers
-
-    def close(self) -> None:
-        """Close the Neo4j driver connection."""
-        self.driver.close()
+        self.embeddings: Optional[Dict[str, np.ndarray]] = None
 
     def create_networkx_graph(self) -> None:
-        """Create a NetworkX graph from the Neo4j database."""
         logger.info("Creating NetworkX graph from Neo4j database...")
         query = """
         MATCH (n)
         OPTIONAL MATCH (n)-[r]->(m)
-        RETURN elementId(n) AS source, labels(n) AS source_labels, n.name AS source_name,
-               elementId(m) AS target, labels(m) AS target_labels, m.name AS target_name,
+        RETURN elementId(n) AS source, labels(n) AS source_labels, n.name AS source_name, n.title AS source_title,
+               elementId(m) AS target, labels(m) AS target_labels, m.name AS target_name, m.title AS target_title,
                type(r) AS rel_type
         """
         try:
@@ -38,25 +32,27 @@ class GraphEmbedder:
                 result = session.run(query)
                 self.graph = nx.DiGraph()
                 for record in result:
-                    source = record['source']
-                    target = record['target']
-                    if source not in self.node_id_map:
-                        self.node_id_map[source] = len(self.node_id_map)
-                    if target and target not in self.node_id_map:
-                        self.node_id_map[target] = len(self.node_id_map)
+                    source = str(record['source'])
+                    target = str(record['target']) if record['target'] is not None else None
                     
-                    self.graph.add_node(self.node_id_map[source], neo4j_id=source, 
-                                        labels=record['source_labels'], name=record['source_name'])
+                    source_name = record['source_title'] if 'Episode' in record['source_labels'] else record['source_name']
+                    self.graph.add_node(source, neo4j_id=source, 
+                                        labels=record['source_labels'], name=source_name)
                     if target:
-                        self.graph.add_node(self.node_id_map[target], neo4j_id=target, 
-                                            labels=record['target_labels'], name=record['target_name'])
-                        self.graph.add_edge(self.node_id_map[source], self.node_id_map[target], 
-                                            type=record['rel_type'])
+                        target_name = record['target_title'] if 'Episode' in record['target_labels'] else record['target_name']
+                        self.graph.add_node(target, neo4j_id=target, 
+                                            labels=record['target_labels'], name=target_name)
+                        self.graph.add_edge(source, target, type=record['rel_type'])
             
             logger.info(f"Created NetworkX graph with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
         except Exception as e:
             logger.error(f"Error creating NetworkX graph: {str(e)}")
             raise
+
+    def close(self) -> None:
+        """Close the Neo4j driver connection."""
+        self.driver.close()
+
 
     def generate_embeddings(self) -> None:
         """Generate graph embeddings using Node2Vec."""
@@ -75,39 +71,50 @@ class GraphEmbedder:
             )
             model = node2vec.fit(window=10, min_count=1, batch_words=4)
             
-            self.embeddings = {node: model.wv[node] for node in self.graph.nodes()}
+            self.embeddings = {self.graph.nodes[node]['neo4j_id']: model.wv[node] for node in self.graph.nodes()}
             logger.info(f"Generated embeddings for {len(self.embeddings)} nodes")
         except Exception as e:
             logger.error(f"Error generating embeddings: {str(e)}")
             raise
 
-    def get_similar_nodes(self, node_name: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        """Find nodes similar to the given node name."""
-        logger.info(f"Finding nodes similar to '{node_name}'...")
+    def get_similar_nodes(self, node_name_or_id: str, top_k: int = 5) -> List[Tuple[str, float, str]]:
+        """Find nodes similar to the given node name or ID."""
+        logger.info(f"Finding nodes similar to '{node_name_or_id}'...")
         if not self.embeddings:
             logger.error("Embeddings have not been generated. Call generate_embeddings() first.")
             raise ValueError("Embeddings have not been generated")
 
         try:
-            # Find the node ID by name
+            # Find the node ID by name or use the provided ID
             node_id = None
             for n, data in self.graph.nodes(data=True):
-                if data['name'] == node_name:
-                    node_id = n
+                if data['neo4j_id'] == node_name_or_id:
+                    node_id = data['neo4j_id']
                     break
-            
-            if node_id is None or node_id not in self.embeddings:
-                logger.warning(f"Node '{node_name}' not found in the graph or embeddings")
+                elif data.get('name') == node_name_or_id or data.get('title') == node_name_or_id:
+                    node_id = data['neo4j_id']
+                    break
+
+            if node_id is None:
+                logger.warning(f"Node '{node_name_or_id}' not found in the graph")
                 return []
+
+            if node_id not in self.embeddings:
+                logger.warning(f"Node '{node_name_or_id}' (ID: {node_id}) not found in embeddings")
+                return []
+
+            logger.info(f"Found node '{node_name_or_id}' with ID: {node_id}")
 
             target_embedding = self.embeddings[node_id]
             similarities = []
 
-            for node, embedding in self.embeddings.items():
-                if node != node_id:
+            for neo4j_id, embedding in self.embeddings.items():
+                if neo4j_id != node_id:
                     similarity = cosine_similarity([target_embedding], [embedding])[0][0]
-                    node_name = self.graph.nodes[node]['name']
-                    similarities.append((node_name, similarity))
+                    node_data = next((data for n, data in self.graph.nodes(data=True) if data['neo4j_id'] == neo4j_id), None)
+                    node_name = node_data.get('name') or node_data.get('title') or f"Unknown (ID: {neo4j_id})"
+                    node_type = ', '.join(node_data.get('labels', []))
+                    similarities.append((node_name, similarity, node_type))
 
             top_similar = sorted(similarities, key=lambda x: x[1], reverse=True)[:top_k]
             logger.info(f"Found {len(top_similar)} similar nodes")
@@ -124,7 +131,7 @@ class GraphEmbedder:
             raise ValueError("No embeddings to save")
 
         try:
-            embeddings_dict = {self.graph.nodes[node]['name']: emb.tolist() for node, emb in self.embeddings.items()}
+            embeddings_dict = {neo4j_id: emb.tolist() for neo4j_id, emb in self.embeddings.items()}
             np.save(EMBEDDINGS_PATH, embeddings_dict)
             logger.info("Embeddings saved successfully")
         except Exception as e:
@@ -136,7 +143,7 @@ class GraphEmbedder:
         logger.info(f"Loading embeddings from {EMBEDDINGS_PATH}...")
         try:
             loaded_dict = np.load(EMBEDDINGS_PATH, allow_pickle=True).item()
-            self.embeddings = {node: np.array(emb) for node, emb in loaded_dict.items()}
+            self.embeddings = {str(neo4j_id): np.array(emb) for neo4j_id, emb in loaded_dict.items()}
             logger.info(f"Loaded embeddings for {len(self.embeddings)} nodes")
         except Exception as e:
             logger.error(f"Error loading embeddings: {str(e)}")
